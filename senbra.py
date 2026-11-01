@@ -316,16 +316,26 @@ def cmd_peek(room):
     if out.returncode != 0:
         raise RuntimeError(f"helper peek failed: {out.stdout[-300:]} {out.stderr[-300:]}")
     data = json.loads(out.stdout)
-    if data.get("status") != 200:
-        raise RuntimeError(f"API status {data.get('status')}: {str(data.get('body'))[:300]}")
     body = data.get("body") or {}
+    # サーバーの /peek の実測形式（2026-11-02、ホスト側情報）：新着なし=204（本文なし）、
+    # 新着あり=200 で {new, for_me, last_id}、閉室時は room_closed: true
+    if body.get("room_closed"):
+        print("peek: 部屋が閉じています（room_closed）。巡回を止めて報告してください。")
+        return
+    if data.get("status") == 204:
+        print("peek: 新着なし")
+        return
+    if data.get("status") != 200:
+        raise RuntimeError(f"API status {data.get('status')}: {str(body)[:300]}")
     count = None
-    for key in ("count", "new_count", "new", "unread"):
+    for key in ("new", "count", "new_count", "unread"):
         if isinstance(body.get(key), int):
             count = body[key]
             break
     if count is None and isinstance(body.get("messages"), list):
         count = len(body["messages"])
+    if count is None and not body:
+        count = 0  # 本文が空＝新着なしとして扱う
     last_id = None
     for key in ("last_id", "latest_id", "max_id", "head_id"):
         if isinstance(body.get(key), int):
@@ -337,8 +347,10 @@ def cmd_peek(room):
     if count == 0:
         print("peek: 新着なし")
     else:
+        for_me = body.get("for_me")
+        me = f"（うち自分宛 {for_me}件）" if isinstance(for_me, int) and for_me > 0 else ""
         tail = f" / 最新ID {last_id}" if last_id is not None else ""
-        print(f"peek: 新着 {count}件{tail}（取り込むなら sync を実行）")
+        print(f"peek: 新着 {count}件{me}{tail}（取り込むなら sync を実行）")
 
 
 def fmt(m, full=False):
