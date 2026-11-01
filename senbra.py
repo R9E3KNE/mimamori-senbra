@@ -47,7 +47,9 @@ v3 までの変更点（サーバー負荷とプライバシー）:
   - 同期の前に peek で新着を確認し、無ければ同期しない（サーバー負荷とトークンの節約）。
     ただし peek はヘルパーの peek コマンド（サーバーの /peek）専用で、通常取得では
     代用しない（結果を捨てる二重読みになる）。ヘルパーに peek が無い環境では、peek を
-    使わず sync のみで運用する。sync 自体は差分＋上限つきの「コンパクトな取得」
+    使わず sync のみで運用する。キャッシュが空の時も peek はしない（after=0 は全件を
+    数える重い問い合わせになる。初回は直接 sync する）。sync 自体は差分＋上限つきの
+    「コンパクトな取得」
   - --backfill は初回構築専用で、1回の実行に BACKFILL_MAX_PAGES ページの上限がある。
     上限で止まっても、再度 --backfill を実行すれば続きから再開できる。全件を一気に
     取り直す --full は、キャッシュを作り直す時だけの例外操作（1回だけ）
@@ -305,7 +307,13 @@ def cmd_peek(room):
     キャッシュもメタも変更しない。"""
     global _HELPER_HAS_PEEK
     msgs = load_cache(room)
-    after = max(msgs) if msgs else 0
+    if not msgs:
+        # 空キャッシュで after=0 の peek をすると、サーバーが全件を数えることになり重い。
+        # 初回は peek 自体が無意味（全部が新着に決まっている）なので、呼ばずに案内する。
+        print("peek: キャッシュが空なので peek はしません（全件を数える重い問い合わせになるため）。"
+              "初回は sync を実行してください。")
+        return
+    after = max(msgs)
     out = _run_helper(["peek", room, "--after", str(after)])
     if out.returncode != 0 and re.search(r"unrecognized|invalid choice|unknown", out.stderr, re.I):
         _HELPER_HAS_PEEK = False
