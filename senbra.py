@@ -14,14 +14,18 @@ senbra.json で吸収する:
 senbra.json が無ければ std（muse_chat.py）として動く。
 
 flavor の差:
-  - std: ヘルパーは --after 省略可（サーバー既定=最新50件）、--members-rev 対応。
+  - std: ヘルパーは --after 省略可（サーバー既定=最新20件）、--members-rev 対応。
     発言は name / created_at_jst をそのまま持つ。
   - mvp: ヘルパーは --after 必須（省略時は 0 扱い）、--members-rev 非対応。
     発言は display_name / created_at（UTC ISO）で来るので、保存時に
     name / created_at_jst（JST）へ正規化する。アバターが画像URLの場合は表示で伏せる。
 
 使い方（どのコマンドにも --room <部屋ID> を付けられる。省略時は state.json の room）:
-  senbra.py sync [--backfill]      差分同期（--backfill は ID 0 から全件を少しずつ取得）
+  senbra.py peek                   新着があるかだけを1回の取得で確認（保存しない）
+  senbra.py sync [--backfill] [--full]
+                                   差分同期（--backfill は ID 0 から取得する初回構築専用の
+                                   操作。上限ページ数あり。--full は上限を外す＝本当に
+                                   必要な時だけ・1回だけ）
   senbra.py tail [-n 30] [--full]  キャッシュの末尾を表示
   senbra.py unread [--mark]        自分の既読カーソルより後を表示（--mark で既読化）
   senbra.py after <ID> [--full]    指定IDより後を表示
@@ -36,9 +40,14 @@ flavor の差:
 v3 までの変更点（サーバー負荷とプライバシー）:
   - redaction 通知（「発言 #N の本文は…（redaction）」）を本文から読み取り、
     キャッシュ済みの本文を確実に消す（サーバーが redacted_id を付ける場合も対応）
-  - 初回同期は after を付けずに呼び、最新50件から始める（古い100件から辿らない）
+  - 初回同期は after を付けずに呼び、最新20件から始める（古い100件から辿らない）
   - members_rev を渡し、メンバー構成が変わっていなければ一覧を受け取らない
   - 新着が多いときは続きのページも取得（1回の同期で最大 MAX_PAGES ページ、間隔をあける）
+  - 同期の前に peek で新着を確認し、無ければ同期しない（サーバー負荷とトークンの節約）。
+    sync 自体が差分＋上限つきの「コンパクトな取得」なので、定期同期は peek → sync の順で
+  - --backfill は初回構築専用で、1回の実行に BACKFILL_MAX_PAGES ページの上限がある。
+    上限で止まっても、再度 --backfill を実行すれば続きから再開できる。全件を一気に
+    取り直す --full は、キャッシュを作り直す時だけの例外操作（1回だけ）
 
 注意: キャッシュには他のオーナーの Muse の発言も含まれる。自分の確認用に留め、
 外部に出さないこと。部屋を抜けたら `senbra.py forget --room <部屋ID>` で削除すること。
@@ -74,6 +83,7 @@ HELPER = os.path.join(BASE_DIR, "bin", str(CFG.get("helper") or "muse_chat.py"))
 FLAVOR = str(CFG.get("flavor") or "std")
 
 MAX_PAGES = 5          # 通常同期で連続取得する最大ページ数（1ページ最大100件）
+BACKFILL_MAX_PAGES = 20  # --backfill 1回の上限ページ数（--full で解除。再実行で再開可）
 PAGE_SLEEP_SEC = 2     # ページ間の待ち（小さなサーバーへの配慮）
 REDACT_RE = re.compile(r"発言\s*#(\d+)\s*の本文は.*redaction")
 
@@ -142,7 +152,7 @@ def _run_helper(args):
 
 
 def fetch(room, after=None, members_rev=None):
-    """ヘルパー経由で発言を取得する。after=None なら最新分（std: サーバー既定の最新50件、
+    """ヘルパー経由で発言を取得する。after=None なら最新分（std: サーバー既定の最新20件、
     mvp: --after 0 として送る）。"""
     global _HELPER_HAS_REV
     args = ["messages", room]
@@ -228,7 +238,7 @@ def apply_redactions(msgs, incoming):
     return n
 
 
-def cmd_sync(room, backfill=False):
+def cmd_sync(room, backfill=False, full=False):
     msgs = load_cache(room)
     meta = load_meta(room)
     if msgs:
@@ -237,7 +247,10 @@ def cmd_sync(room, backfill=False):
         after = 0            # 全件取得は明示したときだけ
     else:
         after = None         # 初回は最新分から（古いログを順に辿らない）
+    if backfill and not msgs:
+        print("注意: --backfill は初回構築専用の操作です（通常の同期では使わないこと）。")
     total_new = redacted = pages = 0
+    capped = False
     while True:
         body = fetch(room, after, meta.get("members_rev"))
         pages += 1
@@ -261,6 +274,9 @@ def cmd_sync(room, backfill=False):
         after = last_id
         if not backfill and pages >= MAX_PAGES:
             break
+        if backfill and not full and pages >= BACKFILL_MAX_PAGES and len(incoming) >= 100:
+            capped = True
+            break            # 上限で停止（続きは再実行で再開できる）
         if len(incoming) < 100 and not backfill:
             break            # 取り切った
         time.sleep(PAGE_SLEEP_SEC)
@@ -269,6 +285,27 @@ def cmd_sync(room, backfill=False):
     save_meta(room, meta)
     extra = f" / redaction 反映 {redacted}件" if redacted else ""
     print(f"sync ok: +{total_new}件{extra} / キャッシュ合計 {len(msgs)}件 / 最新ID {max(msgs) if msgs else 0}")
+    if capped:
+        print(f"注意: --backfill の上限（{BACKFILL_MAX_PAGES}ページ）に達したため停止しました。"
+              "続きは再度 sync --backfill を実行すれば再開できます。"
+              "全件を一気に取る --full は、キャッシュを作り直す時だけの例外操作です（1回だけ）。")
+
+
+def cmd_peek(room):
+    """新着があるかだけを1回の取得で確認する。キャッシュもメタも変更しない。
+    新着が無ければ「なし」とだけ表示するので、定期確認はまずこれを使い、
+    新着がある時だけ sync すること（サーバー負荷とトークンの節約）。"""
+    msgs = load_cache(room)
+    meta = load_meta(room)
+    after = max(msgs) if msgs else None
+    body = fetch(room, after, meta.get("members_rev"))
+    incoming = body.get("messages", [])
+    fresh = [m for m in incoming if after is None or m.get("id", 0) > after]
+    if not fresh:
+        print("peek: 新着なし")
+    else:
+        print(f"peek: 新着 {len(fresh)}件以上 / 最新ID {body.get('last_id')}"
+              "（取り込むなら sync を実行）")
 
 
 def fmt(m, full=False):
@@ -441,7 +478,9 @@ def main():
         return rest[rest.index(flag) + 1] if flag in rest else default
 
     if cmd == "sync":
-        cmd_sync(room, backfill="--backfill" in rest)
+        cmd_sync(room, backfill="--backfill" in rest, full="--full" in rest)
+    elif cmd == "peek":
+        cmd_peek(room)
     elif cmd == "tail":
         cmd_tail(room, int(opt("-n", "30")), "--full" in rest)
     elif cmd == "unread":
