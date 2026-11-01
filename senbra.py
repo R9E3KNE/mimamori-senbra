@@ -21,7 +21,8 @@ flavor の差:
     name / created_at_jst（JST）へ正規化する。アバターが画像URLの場合は表示で伏せる。
 
 使い方（どのコマンドにも --room <部屋ID> を付けられる。省略時は state.json の room）:
-  senbra.py peek                   新着があるかだけを1回の取得で確認（保存しない）
+  senbra.py peek                   新着があるかだけを確認（ヘルパーの peek コマンド専用。
+                                   無い環境では使わず sync のみで運用すること）
   senbra.py sync [--backfill] [--full]
                                    差分同期（--backfill は ID 0 から取得する初回構築専用の
                                    操作。上限ページ数あり。--full は上限を外す＝本当に
@@ -44,7 +45,9 @@ v3 までの変更点（サーバー負荷とプライバシー）:
   - members_rev を渡し、メンバー構成が変わっていなければ一覧を受け取らない
   - 新着が多いときは続きのページも取得（1回の同期で最大 MAX_PAGES ページ、間隔をあける）
   - 同期の前に peek で新着を確認し、無ければ同期しない（サーバー負荷とトークンの節約）。
-    sync 自体が差分＋上限つきの「コンパクトな取得」なので、定期同期は peek → sync の順で
+    ただし peek はヘルパーの peek コマンド（サーバーの /peek）専用で、通常取得では
+    代用しない（結果を捨てる二重読みになる）。ヘルパーに peek が無い環境では、peek を
+    使わず sync のみで運用する。sync 自体は差分＋上限つきの「コンパクトな取得」
   - --backfill は初回構築専用で、1回の実行に BACKFILL_MAX_PAGES ページの上限がある。
     上限で止まっても、再度 --backfill を実行すれば続きから再開できる。全件を一気に
     取り直す --full は、キャッシュを作り直す時だけの例外操作（1回だけ）
@@ -291,21 +294,51 @@ def cmd_sync(room, backfill=False, full=False):
               "全件を一気に取る --full は、キャッシュを作り直す時だけの例外操作です（1回だけ）。")
 
 
+_HELPER_HAS_PEEK = None  # ヘルパー peek の有無（None=未確認、初回の結果で判定）
+
+
 def cmd_peek(room):
-    """新着があるかだけを1回の取得で確認する。キャッシュもメタも変更しない。
-    新着が無ければ「なし」とだけ表示するので、定期確認はまずこれを使い、
-    新着がある時だけ sync すること（サーバー負荷とトークンの節約）。"""
+    """新着があるかだけを確認する。必ずヘルパーの peek コマンド（サーバーの
+    /api/rooms/<room>/peek?after=N）経由で行い、通常のメッセージ取得は呼ばない。
+    通常取得で代用すると、結果を捨てる分だけサーバーに二重読みを強いるため。
+    ヘルパーに peek が無い環境では代用せず、「sync のみで運用を」と案内して終わる。
+    キャッシュもメタも変更しない。"""
+    global _HELPER_HAS_PEEK
     msgs = load_cache(room)
-    meta = load_meta(room)
-    after = max(msgs) if msgs else None
-    body = fetch(room, after, meta.get("members_rev"))
-    incoming = body.get("messages", [])
-    fresh = [m for m in incoming if after is None or m.get("id", 0) > after]
-    if not fresh:
+    after = max(msgs) if msgs else 0
+    out = _run_helper(["peek", room, "--after", str(after)])
+    if out.returncode != 0 and re.search(r"unrecognized|invalid choice|unknown", out.stderr, re.I):
+        _HELPER_HAS_PEEK = False
+    if _HELPER_HAS_PEEK is False:
+        print("peek: この環境のヘルパーには peek コマンドがありません。"
+              "通常取得で代用すると二重読みになるため、peek は使わず sync のみで運用してください。")
+        return
+    if out.returncode != 0:
+        raise RuntimeError(f"helper peek failed: {out.stdout[-300:]} {out.stderr[-300:]}")
+    data = json.loads(out.stdout)
+    if data.get("status") != 200:
+        raise RuntimeError(f"API status {data.get('status')}: {str(data.get('body'))[:300]}")
+    body = data.get("body") or {}
+    count = None
+    for key in ("count", "new_count", "new", "unread"):
+        if isinstance(body.get(key), int):
+            count = body[key]
+            break
+    if count is None and isinstance(body.get("messages"), list):
+        count = len(body["messages"])
+    last_id = None
+    for key in ("last_id", "latest_id", "max_id", "head_id"):
+        if isinstance(body.get(key), int):
+            last_id = body[key]
+            break
+    if count is None:
+        raise RuntimeError(f"peek の応答形式が想定と異なります（body のキー: {sorted(body)}）。"
+                           "推測で報告せず中断します。応答形式が分かれば教えてください。")
+    if count == 0:
         print("peek: 新着なし")
     else:
-        print(f"peek: 新着 {len(fresh)}件以上 / 最新ID {body.get('last_id')}"
-              "（取り込むなら sync を実行）")
+        tail = f" / 最新ID {last_id}" if last_id is not None else ""
+        print(f"peek: 新着 {count}件{tail}（取り込むなら sync を実行）")
 
 
 def fmt(m, full=False):
