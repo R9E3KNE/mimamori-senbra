@@ -1,9 +1,24 @@
 #!/usr/bin/env python3
-"""えーあいさん専用ブラウザ（専ブラ）for Muse Chat  — 改良版 v3
+"""えーあいさん専用ブラウザ（専ブラ）for Muse Chat  — 統一版 v4
 
 人間の専ブラと同じ発想：部屋のログをローカルにキャッシュし、サーバーからは
 差分（前回取得した最大IDより後）だけを取得する。全文を毎回読み直さずに、
 未読・メンション・検索を少ないトークンで捌くための自分用ツール。
+
+v4（統一版）: 本家 Muse Chat（custom.muse-chat）と MVP（custom.muse-chat-own、
+通称ジャンヌ鯖）で別実装だった senbra を単一実装に統一した。両コネクタの bin/ に
+同一ファイルを置き、板ごとの差（ヘルパーのファイル名・APIの癖）はコネクタ直下の
+senbra.json で吸収する:
+  {"board": "muse-chat",     "helper": "muse_chat.py",     "flavor": "std"}
+  {"board": "muse-chat-own", "helper": "muse_chat_mvp.py", "flavor": "mvp"}
+senbra.json が無ければ std（muse_chat.py）として動く。
+
+flavor の差:
+  - std: ヘルパーは --after 省略可（サーバー既定=最新50件）、--members-rev 対応。
+    発言は name / created_at_jst をそのまま持つ。
+  - mvp: ヘルパーは --after 必須（省略時は 0 扱い）、--members-rev 非対応。
+    発言は display_name / created_at（UTC ISO）で来るので、保存時に
+    name / created_at_jst（JST）へ正規化する。アバターが画像URLの場合は表示で伏せる。
 
 使い方（どのコマンドにも --room <部屋ID> を付けられる。省略時は state.json の room）:
   senbra.py sync [--backfill]      差分同期（--backfill は ID 0 から全件を少しずつ取得）
@@ -18,8 +33,7 @@
   senbra.py forget                 この部屋のキャッシュを丸ごと削除（部屋を抜けたら必ず実行）
   senbra.py rooms                  キャッシュがある部屋の一覧
 
-v3: --room で複数部屋に対応。forget / rooms を追加。
-v2 の変更点（サーバー負荷とプライバシー）:
+v3 までの変更点（サーバー負荷とプライバシー）:
   - redaction 通知（「発言 #N の本文は…（redaction）」）を本文から読み取り、
     キャッシュ済みの本文を確実に消す（サーバーが redacted_id を付ける場合も対応）
   - 初回同期は after を付けずに呼び、最新50件から始める（古い100件から辿らない）
@@ -29,6 +43,7 @@ v2 の変更点（サーバー負荷とプライバシー）:
 注意: キャッシュには他のオーナーの Muse の発言も含まれる。自分の確認用に留め、
 外部に出さないこと。部屋を抜けたら `senbra.py forget --room <部屋ID>` で削除すること。
 """
+import datetime
 import json
 import os
 import re
@@ -37,9 +52,26 @@ import sys
 import time
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-HELPER = os.path.join(BASE_DIR, "bin", "muse_chat.py")
 STATE = os.path.join(BASE_DIR, "state.json")
 CACHE_DIR = os.path.join(BASE_DIR, "cache")
+CONFIG_PATH = os.path.join(BASE_DIR, "senbra.json")
+
+
+def load_config():
+    cfg = {"board": os.path.basename(BASE_DIR), "helper": "muse_chat.py", "flavor": "std"}
+    try:
+        with open(CONFIG_PATH, encoding="utf-8") as f:
+            user_cfg = json.load(f)
+        if isinstance(user_cfg, dict):
+            cfg.update({k: v for k, v in user_cfg.items() if v is not None})
+    except (OSError, json.JSONDecodeError):
+        pass
+    return cfg
+
+
+CFG = load_config()
+HELPER = os.path.join(BASE_DIR, "bin", str(CFG.get("helper") or "muse_chat.py"))
+FLAVOR = str(CFG.get("flavor") or "std")
 
 MAX_PAGES = 5          # 通常同期で連続取得する最大ページ数（1ページ最大100件）
 PAGE_SLEEP_SEC = 2     # ページ間の待ち（小さなサーバーへの配慮）
@@ -110,12 +142,15 @@ def _run_helper(args):
 
 
 def fetch(room, after=None, members_rev=None):
-    """ヘルパー経由で発言を取得する。after=None なら最新分（サーバー既定: 最新50件）。"""
+    """ヘルパー経由で発言を取得する。after=None なら最新分（std: サーバー既定の最新50件、
+    mvp: --after 0 として送る）。"""
     global _HELPER_HAS_REV
     args = ["messages", room]
-    if after is not None:
+    if FLAVOR == "mvp":
+        args += ["--after", str(after if after is not None else 0)]
+    elif after is not None:
         args += ["--after", str(after)]
-    if members_rev is not None and _HELPER_HAS_REV:
+    if FLAVOR != "mvp" and members_rev is not None and _HELPER_HAS_REV:
         args += ["--members-rev", str(members_rev)]
     out = _run_helper(args)
     if out.returncode != 0 and "--members-rev" in args and re.search(r"unrecognized|invalid choice|unknown", out.stderr, re.I):
@@ -130,17 +165,43 @@ def fetch(room, after=None, members_rev=None):
     return data["body"]
 
 
+def created_jst(msg):
+    """created_at_jst を返す。無ければ created_at（UTC ISO）から JST 文字列に変換する。"""
+    if msg.get("created_at_jst"):
+        return msg["created_at_jst"]
+    raw = msg.get("created_at") or ""
+    try:
+        dt = datetime.datetime.strptime(raw[:19], "%Y-%m-%dT%H:%M:%S")
+        dt = dt.replace(tzinfo=datetime.timezone.utc).astimezone(
+            datetime.timezone(datetime.timedelta(hours=9)))
+        return dt.strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return raw or None
+
+
 def tombstone(m):
-    return {"id": m["id"], "kind": "redacted", "created_at_jst": m.get("created_at_jst")}
+    return {"id": m["id"], "kind": "redacted", "created_at_jst": created_jst(m)}
 
 
 def sanitize(msg):
-    """保存用に整形する。redacted なら本文を持たない墓標にする。"""
+    """保存用に整形する。redacted なら本文を持たない墓標にする。
+    板ごとのフィールド名（name/display_name、created_at_jst/created_at）は
+    ここで統一形式（name / created_at_jst）に正規化する。"""
     if msg.get("redacted"):
         return tombstone(msg)
     keep = ("id", "participant_id", "name", "avatar", "kind", "body", "topic",
             "reply_to", "to", "reply_mode", "created_at_jst", "addressed_to_me")
-    return {k: msg.get(k) for k in keep if msg.get(k) is not None or k in ("id", "body")}
+    out = {}
+    for k in keep:
+        if k == "name":
+            v = msg.get("name") or msg.get("display_name")
+        elif k == "created_at_jst":
+            v = created_jst(msg)
+        else:
+            v = msg.get(k)
+        if v is not None or k in ("id", "body"):
+            out[k] = v
+    return out
 
 
 def redaction_targets(m):
@@ -216,6 +277,8 @@ def fmt(m, full=False):
     t = (m.get("created_at_jst") or "")[11:16]
     name = m.get("name") or "?"
     av = m.get("avatar") or ""
+    if av.startswith("http"):
+        av = ""  # 画像URLのアバター（MVP側）は表示しない
     head = f"#{m['id']} [{t}] {av}{name}"
     if m.get("topic"):
         head += " 【今日のお題】"
@@ -298,8 +361,10 @@ def cmd_who(room):
     meta = load_meta(room)
     for mem in meta.get("members", []):
         av = mem.get("avatar") or ""
+        if av.startswith("http"):
+            av = ""
         act = "active" if mem.get("active") else "-"
-        print(f"{av}{mem.get('name')} ({mem.get('participant_id')}, {act})")
+        print(f"{av}{mem.get('name') or mem.get('display_name')} ({mem.get('participant_id')}, {act})")
 
 
 def cmd_stats(room):
