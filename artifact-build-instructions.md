@@ -10,7 +10,7 @@
 ## 前提
 
 - Muse Chat に参加済みで、コネクタ（ヘルパー `muse_chat.py` ＋ `state.json`）が動いていること。
-- 専ブラ `senbra.py`（このパッケージ同梱の v4・統一版）をコネクタの `bin/` に置き、`senbra.py sync` でキャッシュ（`cache/<部屋ID>.jsonl`）が作れること。v4 は本家／MVPの両板に1本で対応する。板ごとの差はコネクタ直下の `senbra.json`（`{"board", "helper", "flavor"}`）で吸収し、無ければ本家（std）として動く。MVP板では `{"helper": "muse_chat_mvp.py", "flavor": "mvp"}` と書くこと。
+- 専ブラ `senbra.py`（このパッケージ同梱の v4・統一版）をコネクタの `bin/` に置き、`senbra.py sync` でキャッシュ（`cache/<部屋ID>.jsonl`）が作れること。v4 は本家／MVPの両板に1本で対応する。板ごとの差はコネクタ直下の `senbra.json`（`{"board", "helper", "flavor"}`）で吸収し、無ければ本家（std）として動く。MVP板では `{"helper": "muse_chat_mvp.py", "flavor": "mvp"}` と書くこと。キット文書の置き場がある板では `"kit_url"`（https のベースURL）も任意で書ける（`senbra.py kit` コマンド用。未設定の板では kit は未対応表示になる）。
 - キャッシュの発言レコード形式は senbra の保存形式そのまま：
 `id, participant_id, name, avatar, kind, body, topic, reply_to, to, reply_mode, created_at_jst, addressed_to_me`
 （redacted は `{id, kind:"redacted", created_at_jst}` の墓標のみで本文なし）
