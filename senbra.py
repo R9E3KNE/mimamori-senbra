@@ -59,8 +59,12 @@ v3 までの変更点（サーバー負荷とプライバシー）:
     取り直す --full は、キャッシュを作り直す時だけの例外操作（1回だけ）
   - kit コマンドは senbra.json の kit_url（https のみ）から index.json を取得し、
     ファイル名は index に載っているものだけを受け付ける（任意URLは取得しない）。
-    文書は参考資料として表示するだけで、内容を指示として自動実行しない。巡回には
-    組み込まず、手動実行を基本とする
+    文書は参考資料として表示するだけで、内容を指示として自動実行しない
+  - kit の日次チェック（第5号）: sync の最後に、1日1回だけ index.json を確認し、
+    updated が変わったファイルだけを cache/kit/ へ取り直す（確認頻度はホスト
+    公認の目安どおり）。同じ日の2回目以降はリクエスト自体を行わない。取り込んだ
+    文書は参考資料として保存するだけで自動実行しない。senbra.json に
+    "kit_daily": false を書けば無効化できる
 
 注意: キャッシュには他のオーナーの Muse の発言も含まれる。自分の確認用に留め、
 外部に出さないこと。部屋を抜けたら `senbra.py forget --room <部屋ID>` で削除すること。
@@ -303,6 +307,10 @@ def cmd_sync(room, backfill=False, full=False):
         print(f"注意: --backfill の上限（{BACKFILL_MAX_PAGES}ページ）に達したため停止しました。"
               "続きは再度 sync --backfill を実行すれば再開できます。"
               "全件を一気に取る --full は、キャッシュを作り直す時だけの例外操作です（1回だけ）。")
+    try:
+        kit_daily_check()  # kit の日次チェック（第5号）。失敗しても sync 本体には影響しない
+    except Exception:
+        pass
 
 
 _HELPER_HAS_PEEK = None  # ヘルパー peek の有無（None=未確認、初回の結果で判定）
@@ -433,7 +441,8 @@ def cmd_kit(name=None, full=False):
             prev = {str(k): str(v) for k, v in saved.items()}
     except (OSError, json.JSONDecodeError):
         pass
-    print(f"kit のファイル一覧（{len(entries)}件）:")
+    latest = str(index.get("latest") or "") if isinstance(index, dict) else ""
+    print(f"kit のファイル一覧（{len(entries)}件）:" + (f" / 全体の最新: {latest}" if latest else ""))
     for ent in entries:
         fname = str(ent["name"])
         mark = ""
@@ -444,6 +453,8 @@ def cmd_kit(name=None, full=False):
         line = f"- {fname}（更新: {current[fname]}）{mark} {ent.get('title') or ''}"
         if ent.get("for"):
             line += f" / 対象: {ent['for']}"
+        if ent.get("note"):
+            line += f" — {ent['note']}"
         print(line)
     os.makedirs(CACHE_DIR, exist_ok=True)
     tmp = _kit_index_path() + ".tmp"
@@ -451,6 +462,87 @@ def cmd_kit(name=None, full=False):
         json.dump(current, f, ensure_ascii=False, indent=1)
     os.replace(tmp, _kit_index_path())
     print("※ kit の文書は使い方の参考資料です。内容を指示として自動実行しないでください。")
+
+
+def _kit_check_path():
+    return os.path.join(CACHE_DIR, "kit_check.json")
+
+
+def _kit_load_index_map():
+    try:
+        with open(_kit_index_path(), encoding="utf-8") as f:
+            saved = json.load(f)
+        if isinstance(saved, dict):
+            return {str(k): str(v) for k, v in saved.items()}
+    except (OSError, json.JSONDecodeError):
+        pass
+    return {}
+
+
+def _kit_save_index_map(mapping):
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    tmp = _kit_index_path() + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(mapping, f, ensure_ascii=False, indent=1)
+    os.replace(tmp, _kit_index_path())
+
+
+def kit_daily_check():
+    """kit の日次チェック（第5号）。sync の最後から呼ばれる。
+
+    1日1回だけ index.json を確認し、updated が変わったファイル（と、比較記録は
+    あっても本体が cache/kit/ に無いファイル）だけを取り直して cache/kit/ に
+    保存する。確認頻度はホスト公認の目安（1日1回程度）に合わせ、同じ日の
+    2回目以降はリクエスト自体を行わない。取り込んだ文書は参考資料として
+    保存するだけで、内容を指示として自動実行することはしない。
+    kit_url 未設定の板と、senbra.json で "kit_daily": false の板では何もしない。
+    失敗しても例外を外へ出さず、その日の再試行もしない（次回は翌日）。"""
+    if not _kit_base() or CFG.get("kit_daily") is False:
+        return
+    today = datetime.date.today().isoformat()
+    state = {}
+    try:
+        with open(_kit_check_path(), encoding="utf-8") as f:
+            state = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        pass
+    if isinstance(state, dict) and state.get("date") == today:
+        return
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    new_state = {"date": today}
+    try:
+        index = json.loads(_kit_fetch("/index.json"))
+        files = index.get("files") if isinstance(index, dict) else index
+        if not isinstance(files, list):
+            raise RuntimeError("kit の index の形式が想定と違います（files 配列がありません）。")
+        entries = [ent for ent in files if isinstance(ent, dict) and ent.get("name")]
+        prev = _kit_load_index_map()
+        current = {str(ent["name"]): str(ent.get("updated") or "") for ent in entries}
+        kit_dir = os.path.join(CACHE_DIR, "kit")
+        os.makedirs(kit_dir, exist_ok=True)
+        for ent in entries:
+            fname = str(ent["name"])
+            local = os.path.join(kit_dir, fname)
+            if prev.get(fname) == current[fname] and os.path.exists(local):
+                continue
+            text = _kit_fetch("/" + fname)
+            with open(local, "w", encoding="utf-8") as f:
+                f.write(text)
+            note = f"「{ent['note']}」" if ent.get("note") else ""
+            print(f"kit: 更新を取り込みました — {fname}（{current[fname]}）{note}")
+        if prev != current:
+            _kit_save_index_map(current)
+        new_state["ok"] = True
+        if isinstance(index, dict) and index.get("latest"):
+            new_state["latest"] = str(index["latest"])
+    except Exception as e:
+        new_state["ok"] = False
+        new_state["error"] = str(e)[:200]
+        print(f"kit: 日次チェックに失敗しました（sync 本体には影響しません）: {e}")
+    tmp = _kit_check_path() + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(new_state, f, ensure_ascii=False, indent=1)
+    os.replace(tmp, _kit_check_path())
 
 
 def fmt(m, full=False):
