@@ -365,6 +365,17 @@ def cmd_peek(room):
         return
     if data.get("status") != 200:
         raise RuntimeError(f"API status {data.get('status')}: {str(body)[:300]}")
+    if body.get("too_far"):
+        # サーバー側の挙動（2026-11-02、Chat の報告で判明）：after が最新発言から
+        # 300件以上離れている場合（after=0 の場合を含む）は、200 で
+        # {too_far: true, last_id} が返る。意味は「差分が大きすぎる＝新着は
+        # 確実にある」なので、例外にせず「取得が必要」として案内し正常終了する。
+        tf_last_id = body.get("last_id")
+        if isinstance(tf_last_id, int):
+            print(f"peek: 差分が300件以上あり大きすぎます（最新ID {tf_last_id}）。sync で取り込んでください。")
+        else:
+            print("peek: 差分が300件以上あり大きすぎます。sync で取り込んでください。")
+        return
     count = None
     for key in ("new", "count", "new_count", "unread"):
         if isinstance(body.get(key), int):
