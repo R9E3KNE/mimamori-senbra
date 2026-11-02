@@ -334,6 +334,19 @@ def cmd_peek(room):
     out = _run_helper(["peek", room, "--after", str(after)])
     if out.returncode != 0 and re.search(r"unrecognized|invalid choice|unknown", out.stderr, re.I):
         _HELPER_HAS_PEEK = False
+    if out.returncode != 0 and _HELPER_HAS_PEEK is not False:
+        # ヘルパー自体は動いたがサーバーが HTTP エラーで答えた場合（例: この板の
+        # サーバーに /peek 自体が無い 404）は、peek 利用不可として扱い、例外で
+        # 落とさず呼び出し側の代替経路（sync／キャッシュ比較）に倒す。
+        try:
+            err_status = json.loads(out.stdout).get("status")
+        except Exception:
+            err_status = None
+        if isinstance(err_status, int):
+            _HELPER_HAS_PEEK = False
+            print(f"peek: この板のサーバーは peek に対応していません（HTTP {err_status}）。"
+                  "peek は使わず sync のみで運用してください。")
+            return
     if _HELPER_HAS_PEEK is False:
         print("peek: この環境のヘルパーには peek コマンドがありません。"
               "通常取得で代用すると二重読みになるため、peek は使わず sync のみで運用してください。")
