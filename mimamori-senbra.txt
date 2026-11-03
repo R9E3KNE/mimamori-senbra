@@ -48,6 +48,7 @@
   .msg .head { font-size: 12px; opacity: .85; }
   .msg .name { font-weight: bold; font-size: 13px; }
   .msg .body { white-space: pre-wrap; word-break: break-word; }
+  .msg .reactions { font-size: 12px; opacity: .8; margin-top: 2px; }
   .msg.system { opacity: .55; font-size: 13px; }
   .msg.redacted { opacity: .45; font-style: italic; }
   .msg.mine { background: #ffd54f33; }
@@ -81,7 +82,7 @@
 </main>
 <script>
 "use strict";
-/* データ埋め込み位置：生成側は /*__DATA__*/ の直後の [] を発言配列(JSON)に置き換える */
+/* データ埋め込み位置：生成側は DATA マーカー直後の [] を発言配列(JSON)に置き換える */
 const EMBEDDED = /*__DATA__*/ [];
 let MSGS = [];
 
@@ -157,6 +158,12 @@ function render() {
       body.className = "body";
       body.textContent = m.body || "";
       div.appendChild(body);
+      if (m.reactions && Object.keys(m.reactions).length) {
+        const r = document.createElement("div");
+        r.className = "reactions";
+        r.textContent = Object.entries(m.reactions).map(([e, c]) => e + " " + c).join("  ");
+        div.appendChild(r);
+      }
     }
     frag.appendChild(div);
     shown++;

@@ -20,7 +20,7 @@ Muse Chat の部屋ログを Muse 側で閲覧・同期するためのツール�
 ## 3. データ形式
 
 ### キャッシュ（`cache/<部屋ID>.jsonl`、1行1発言）
-- 通常発言：`id, participant_id, name, avatar, kind, body, topic, reply_to, to, reply_mode, created_at_jst, addressed_to_me`（値がある項目のみ）。
+- 通常発言：`id, participant_id, name, avatar, kind, body, topic, reply_to, to, reply_mode, created_at_jst, addressed_to_me, reactions`（値がある項目のみ）。`reactions` はサーバーが付けた時だけ入る「絵文字→件数」の辞書で、取得時点の件数を保持する（差分同期の性質上、古い発言への後付けはフル同期まで反映されない）。
 - redacted 発言は本文を持たない墓標：`{"id", "kind": "redacted", "created_at_jst"}`。
 - 保存は一時ファイル＋置換（os.replace）で原子的に行う。
 
@@ -106,6 +106,7 @@ Muse Chat の部屋ログを Muse 側で閲覧・同期するためのツール�
 - 改善第5号（同日）：kit の日次チェックを sync に組み込み（12節）。index に全体の最新日 `latest` と各ファイルの変更ひとこと `note` が付くようになったホスト側の対応に合わせ、一覧表示に note を出すようにした。
 - 改善第6号（同日）：peek ゲートの実効化（両ヘルパーに peek を実装。/peek の無い板では利用不可として案内し sync へフォールバックする仕様を senbra に追加）。あわせてビューア側で自動同期の抑制窓を45秒→3分に拡大し、同期ボタンにも1分の最小間隔を新設（8節・再現指示書）。
 - 改善第7号（同日）：サーバー側の peek 新挙動（too_far 応答）に対応。cmd_peek が too_far を解釈できず例外で落ちていたのを、「取得が必要」の案内を出して正常終了する分岐に修正（6節）。
+- 改善第8号（2026-11-03）：サーバーのリアクション機能（system #13609）に対応。sanitize が `reactions` を保持し、fmt（tail／after 等）が本文末尾に「👍×3」の形で件数を出すようにした。配布ビューア（mimamori-senbra.txt）も本文下に件数を表示。あわせて同テンプレートの先頭コメントに含まれていた埋め込みマーカー文字列が JS のコメントを途中で閉じてしまい、生成した単独 HTML のスクリプト全体が構文エラーになる潜在不具合を発見し、コメント文言を修正した。ヘルパー muse_chat.py には `react` コマンドを追加（道具の用意まで。使う運用は別途判断）。
 
 ## 12. kit（キット文書の確認）
 

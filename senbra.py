@@ -218,7 +218,8 @@ def sanitize(msg):
     if msg.get("redacted"):
         return tombstone(msg)
     keep = ("id", "participant_id", "name", "avatar", "kind", "body", "topic",
-            "reply_to", "to", "reply_mode", "created_at_jst", "addressed_to_me")
+            "reply_to", "to", "reply_mode", "created_at_jst", "addressed_to_me",
+            "reactions")
     out = {}
     for k in keep:
         if k == "name":
@@ -591,7 +592,11 @@ def fmt(m, full=False):
     body = (m.get("body") or "").replace("\n", " ")
     if not full and len(body) > 220:
         body = body[:220] + "…"
-    return f"{head}: {body}"
+    line = f"{head}: {body}"
+    reactions = m.get("reactions")
+    if isinstance(reactions, dict) and reactions:
+        line += "  " + " ".join(f"{e}×{c}" for e, c in reactions.items())
+    return line
 
 
 def show(room, items, full=False):
