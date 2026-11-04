@@ -37,6 +37,8 @@ flavor の差:
   senbra.py mentions [-n 20] [--strict]  自分宛の発言だけ表示
   senbra.py search <語>            キャッシュ内を部分一致検索
   senbra.py who                    最終同期時点のメンバー一覧
+  senbra.py badges                 自分の勲章（/api/me の badges）を表示。他人の分は
+                                   サーバーが公開していないため表示できない
   senbra.py stats                  キャッシュの状態
   senbra.py purge <id>             指定IDのキャッシュ本文を消去（手動の redaction 追随）
   senbra.py forget                 この部屋のキャッシュを丸ごと削除（部屋を抜けたら必ず実行）
@@ -690,6 +692,32 @@ def cmd_who(room):
         print(f"{av}{mem.get('name') or mem.get('display_name')} ({mem.get('participant_id')}, {act})")
 
 
+def cmd_badges():
+    """自分の勲章（/api/me の badges）を表示する。サーバーが公開しているのは
+    本人の分だけで、他人の勲章は発言データにもメンバー一覧にも載らないため、
+    表示できるのは自分の分だけ（キット UPDATE_NOTE 2026-11-02 の仕様）。"""
+    out = _run_helper(["me"])
+    if out.returncode != 0 and re.search(r"unrecognized|invalid choice|unknown", out.stderr, re.I):
+        print("この環境のヘルパーは /api/me（me コマンド）に対応していないため、勲章を表示できません。")
+        return
+    if out.returncode != 0:
+        raise RuntimeError(f"helper failed: {out.stdout[-500:]} {out.stderr[-500:]}")
+    data = json.loads(out.stdout)
+    if data.get("status") != 200:
+        raise RuntimeError(f"API status {data.get('status')}: {str(data.get('body'))[:300]}")
+    body = data["body"]
+    name = body.get("display_name") or body.get("name") or "自分"
+    badges = body.get("badges") or []
+    print(f"自分の勲章（{name}）: {len(badges)}件")
+    if not badges:
+        print("（まだ勲章がありません）")
+    for b in badges:
+        grade = f"[{b['grade']}] " if b.get("grade") else ""
+        cond = f"（{b['condition']}）" if b.get("condition") else ""
+        date = b.get("date") or ""
+        print(f"{grade}{b.get('name', '')}{cond} {date}".rstrip())
+
+
 def cmd_stats(room):
     msgs = load_cache(room)
     meta = load_meta(room)
@@ -788,6 +816,8 @@ def main():
         cmd_search(room, rest[0])
     elif cmd == "who":
         cmd_who(room)
+    elif cmd == "badges":
+        cmd_badges()
     elif cmd == "stats":
         cmd_stats(room)
     elif cmd == "forget":
