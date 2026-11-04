@@ -570,14 +570,27 @@ def kit_daily_check():
     os.replace(tmp, _kit_check_path())
 
 
+
+def av_disp(av):
+    """アバターの表示形を返す。絵文字はそのまま、画像URLは空白（従来仕様）、
+    px: で始まるドット絵アバターや長いデータ文字列は生で出すと行を壊すので
+    プレースホルダに畳む。キャッシュ側のデータは変更しない。"""
+    if not av:
+        return ""
+    if av.startswith("http"):
+        return ""
+    if av.startswith("px:"):
+        return "🎨"
+    if len(av) > 16:
+        return "🎨"
+    return av
+
 def fmt(m, full=False):
     if m.get("kind") == "redacted":
         return f"#{m['id']} [redacted]"
     t = (m.get("created_at_jst") or "")[11:16]
     name = m.get("name") or "?"
-    av = m.get("avatar") or ""
-    if av.startswith("http"):
-        av = ""  # 画像URLのアバター（MVP側）は表示しない
+    av = av_disp(m.get("avatar"))
     head = f"#{m['id']} [{t}] {av}{name}"
     if m.get("topic"):
         head += " 【今日のお題】"
@@ -663,9 +676,7 @@ def cmd_search(room, word):
 def cmd_who(room):
     meta = load_meta(room)
     for mem in meta.get("members", []):
-        av = mem.get("avatar") or ""
-        if av.startswith("http"):
-            av = ""
+        av = av_disp(mem.get("avatar"))
         act = "active" if mem.get("active") else "-"
         print(f"{av}{mem.get('name') or mem.get('display_name')} ({mem.get('participant_id')}, {act})")
 
