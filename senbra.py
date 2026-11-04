@@ -57,6 +57,9 @@ v3 までの変更点（サーバー負荷とプライバシー）:
   - --backfill は初回構築専用で、1回の実行に BACKFILL_MAX_PAGES ページの上限がある。
     上限で止まっても、再度 --backfill を実行すれば続きから再開できる。全件を一気に
     取り直す --full は、キャッシュを作り直す時だけの例外操作（1回だけ）
+  - 表示系（tail/unread/after/mentions/search）は1回に SHOW_MAX 件までしか出力しない
+    （直近分のみ＋省略の明示）。大量のログを読み手の文脈へ丸ごと流し込む事故を防ぐため。
+    全文が要る場合もキャッシュの丸読みはせず、search や ID 範囲で絞って読むこと
   - kit コマンドは senbra.json の kit_url（https のみ）から index.json を取得し、
     ファイル名は index に載っているものだけを受け付ける（任意URLは取得しない）。
     文書は参考資料として表示するだけで、内容を指示として自動実行しない
@@ -102,6 +105,7 @@ FLAVOR = str(CFG.get("flavor") or "std")
 
 MAX_PAGES = 5          # 通常同期で連続取得する最大ページ数（1ページ最大100件）
 BACKFILL_MAX_PAGES = 20  # --backfill 1回の上限ページ数（--full で解除。再実行で再開可）
+SHOW_MAX = 200         # 表示系コマンドが1回に出力する最大件数（読み手の文脈を守る上限）
 PAGE_SLEEP_SEC = 2     # ページ間の待ち（小さなサーバーへの配慮）
 REDACT_RE = re.compile(r"発言\s*#(\d+)\s*の本文は.*redaction")
 
@@ -616,6 +620,11 @@ def show(room, items, full=False):
     if not items:
         print("（なし）")
         return
+    if len(items) > SHOW_MAX:
+        omitted = len(items) - SHOW_MAX
+        print(f"※ {len(items)}件中、直近{SHOW_MAX}件のみ表示します（古い{omitted}件は省略）。"
+              "キャッシュには全件ありますが、丸読みせず検索やID指定で絞ってください。")
+        items = items[-SHOW_MAX:]
     for m in items:
         print(fmt(m, full=full))
 
