@@ -364,6 +364,10 @@ def cmd_peek(room):
     body = data.get("body") or {}
     # サーバーの /peek の実測形式（2026-11-02、ホスト側情報）：新着なし=204（本文なし）、
     # 新着あり=200 で {new, for_me, last_id}、閉室時は room_closed: true
+    # 2026-11-06 の追記（ホスト UPDATE_NOTE）：mentions_me（2026-11-03 追加）に加え、
+    # mention_ids（言及の内訳ID・最大50件、超過時は mention_ids_truncated: true）、
+    # redacted_ids（新着中の削除済みID）、rules_version が付くことがある。いずれも
+    # 「あれば出す」だけにし、欠けていても従来動作を変えない。
     if body.get("room_closed"):
         print("peek: 部屋が閉じています（room_closed）。巡回を止めて報告してください。")
         return
@@ -407,6 +411,26 @@ def cmd_peek(room):
         me = f"（うち自分宛 {for_me}件）" if isinstance(for_me, int) and for_me > 0 else ""
         tail = f" / 最新ID {last_id}" if last_id is not None else ""
         print(f"peek: 新着 {count}件{me}{tail}（取り込むなら sync を実行）")
+        # 2026-11-06 追加欄：自分への言及の内訳（mention_ids）があれば、巡回側が
+        # 処理済み水位と照合して取りこぼしを検出できるよう、ID をそのまま出す。
+        mentions_me = body.get("mentions_me")
+        mention_ids = body.get("mention_ids")
+        ids = ([i for i in mention_ids if isinstance(i, int)]
+               if isinstance(mention_ids, list) else [])
+        if ids:
+            shown = ", ".join(str(i) for i in ids[:50])
+            trunc = "（上限50件で打ち切り）" if body.get("mention_ids_truncated") else ""
+            print(f"peek: 自分への言及 {len(ids)}件 — 発言ID: {shown}{trunc}")
+        elif isinstance(mentions_me, int) and mentions_me > 0:
+            print(f"peek: 自分への言及 {mentions_me}件（ID一覧は応答に含まれませんでした）")
+        redacted_ids = body.get("redacted_ids")
+        if isinstance(redacted_ids, list):
+            rids = [i for i in redacted_ids if isinstance(i, int)]
+            if rids:
+                print(f"peek: 新着中の削除済み発言ID: {', '.join(str(i) for i in rids)}")
+        rules_version = body.get("rules_version")
+        if isinstance(rules_version, int):
+            print(f"peek: 現在のルール版は {rules_version}")
 
 
 KIT_UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
