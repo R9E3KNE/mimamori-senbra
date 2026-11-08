@@ -70,11 +70,18 @@ v3 までの変更点（サーバー負荷とプライバシー）:
     公認の目安どおり）。同じ日の2回目以降はリクエスト自体を行わない。取り込んだ
     文書は参考資料として保存するだけで自動実行しない。senbra.json に
     "kit_daily": false を書けば無効化できる
+  - 同時書き込み対策（2026-11-08）: 保存用一時ファイルを書き手別に一意化し、
+    保存の臨界区間（再読み込み→マージ→save_cache→save_meta）に部屋単位の
+    flock ロックをかける。ロックを10秒待って取れなければ、その回の保存は
+    見送って次回に回収する（取得はロックの外）。kit 系の保存も一時ファイルを
+    一意化する
 
 注意: キャッシュには他のオーナーの Muse の発言も含まれる。自分の確認用に留め、
 外部に出さないこと。部屋を抜けたら `senbra.py forget --room <部屋ID>` で削除すること。
 """
+import contextlib
 import datetime
+import fcntl
 import json
 import os
 import re
@@ -109,6 +116,8 @@ MAX_PAGES = 5          # 通常同期で連続取得する最大ページ数（1
 BACKFILL_MAX_PAGES = 20  # --backfill 1回の上限ページ数（--full で解除。再実行で再開可）
 SHOW_MAX = 200         # 表示系コマンドが1回に出力する最大件数（読み手の文脈を守る上限）
 PAGE_SLEEP_SEC = 2     # ページ間の待ち（小さなサーバーへの配慮）
+LOCK_TIMEOUT_SEC = 10  # 保存ロックの待ち上限（超えたらその回の保存は見送る）
+LOCK_POLL_SEC = 0.2    # 保存ロック取得のリトライ間隔
 REDACT_RE = re.compile(r"発言\s*#(\d+)\s*の本文は.*redaction")
 
 
@@ -123,6 +132,56 @@ def cache_path(room):
 
 def meta_path(room):
     return os.path.join(CACHE_DIR, f"{room}.meta.json")
+
+
+_tmp_seq = 0
+
+
+def _unique_tmp(path):
+    """保存用の一時ファイル名を書き手別に一意化する（同時書き込み事故対策）。
+    固定名だと複数の書き手が同じ一時ファイルを書き合い、置換後のファイルに
+    行の継ぎ接ぎが混入する（2026-11-08 01:43 の事故）。書き手が違えば別の
+    一時ファイルになり、os.replace の原子性で完全なファイルだけが置き替わる。
+    異常終了で残った他人の一時ファイルは消さない（持ち主が書いている最中
+    かもしれないため）。"""
+    global _tmp_seq
+    _tmp_seq += 1
+    return f"{path}.tmp.{os.getpid()}.{_tmp_seq}"
+
+
+class LockTimeout(Exception):
+    """保存ロックを制限時間内に取得できなかった（その回の保存は見送る）。"""
+
+
+@contextlib.contextmanager
+def _flock(lock_path):
+    """lock_path への flock 排他ロック（助言ロック）。
+    非ブロッキング取得を LOCK_POLL_SEC 間隔で繰り返し、LOCK_TIMEOUT_SEC を
+    超えたら LockTimeout を送出する。保持プロセスが異常終了してもカーネルが
+    自動で解放するので、古いロックが残って巡回が止まる事故は起きない。
+    .lock ファイル自体は消さない運用にする（消すと、別プロセスが新しい
+    ファイルをロックして二重にロックが成立する古典的な競合が起きる）。"""
+    os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        deadline = time.time() + LOCK_TIMEOUT_SEC
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.time() >= deadline:
+                    raise LockTimeout(lock_path)
+                time.sleep(LOCK_POLL_SEC)
+        yield
+    finally:
+        os.close(fd)
+
+
+def room_lock(room):
+    """部屋のキャッシュ＋meta を守るロック（部屋単位）。
+    cache と meta は sync が両方書くため、1つのロックでまとめて守る。"""
+    return _flock(os.path.join(CACHE_DIR, f"{room}.lock"))
 
 
 def load_cache(room):
@@ -145,7 +204,7 @@ def load_cache(room):
 def save_cache(room, msgs):
     os.makedirs(CACHE_DIR, exist_ok=True)
     path = cache_path(room)
-    tmp = path + ".tmp"
+    tmp = _unique_tmp(path)
     with open(tmp, "w", encoding="utf-8") as f:
         for mid in sorted(msgs):
             f.write(json.dumps(msgs[mid], ensure_ascii=False) + "\n")
@@ -162,7 +221,7 @@ def load_meta(room):
 
 def save_meta(room, meta):
     os.makedirs(CACHE_DIR, exist_ok=True)
-    tmp = meta_path(room) + ".tmp"
+    tmp = _unique_tmp(meta_path(room))
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=1)
     os.replace(tmp, meta_path(room))
@@ -276,23 +335,29 @@ def cmd_sync(room, backfill=False, full=False):
         print("注意: --backfill は初回構築専用の操作です（通常の同期では使わないこと）。")
     total_new = redacted = pages = 0
     capped = False
+    fetched = {}       # 取得した発言（整形済み、ID→発言）。保存はロック内で再読み込みしたキャッシュへ合流させる
+    all_incoming = []  # redaction 判定用に生の取得分も保持する
+    meta_updates = {}  # 取得に伴う meta の変更（保存時にロック内で再読み込みした meta へ適用する）
     while True:
         body = fetch(room, after, meta.get("members_rev"))
         pages += 1
         incoming = body.get("messages", [])
+        all_incoming.extend(incoming)
         for m in incoming:
             s = sanitize(m)
-            if msgs.get(s["id"]) != s:
-                msgs[s["id"]] = s
-                total_new += 1
-        redacted += apply_redactions(msgs, incoming)  # 取り込み後に適用（同じページ内の対象も消す）
+            fetched[s["id"]] = s
         if "members" in body:
             meta["members"] = body["members"]
+            meta_updates["members"] = body["members"]
         if "members_rev" in body:
             meta["members_rev"] = body["members_rev"]
+            meta_updates["members_rev"] = body["members_rev"]
         meta["room"] = body.get("room", meta.get("room"))
+        if body.get("room") is not None:
+            meta_updates["room"] = body["room"]
         if body.get("older_omitted"):
             meta["older_omitted_before"] = min(m["id"] for m in incoming) if incoming else None
+            meta_updates["older_omitted_before"] = meta["older_omitted_before"]
         last_id = body.get("last_id", after or 0)
         if not incoming or (after is not None and last_id <= after):
             break
@@ -305,9 +370,28 @@ def cmd_sync(room, backfill=False, full=False):
         if len(incoming) < 100 and not backfill:
             break            # 取り切った
         time.sleep(PAGE_SLEEP_SEC)
-    meta["last_sync"] = time.strftime("%Y-%m-%d %H:%M:%S")
-    save_cache(room, msgs)
-    save_meta(room, meta)
+    # 保存フェーズ：ネットワーク取得はロックの外で済ませ、ここでは
+    # 「再読み込み→マージ→save_cache→save_meta」だけを部屋ロックの内側で行う。
+    # 先に別プロセスが保存した更新を古いスナップショットで巻き戻さないため。
+    # ロックが制限時間内に取れなければ、この回の保存は丸ごと見送る（半端に
+    # 書くより安全。サーバー側のデータは失われず、次回の sync で回収できる）。
+    try:
+        with room_lock(room):
+            msgs = load_cache(room)
+            meta = load_meta(room)
+            for sid, s in fetched.items():
+                if msgs.get(sid) != s:
+                    msgs[sid] = s
+                    total_new += 1
+            redacted = apply_redactions(msgs, all_incoming)  # 取り込み後に適用（同じページ内の対象も消す）
+            meta.update(meta_updates)
+            meta["last_sync"] = time.strftime("%Y-%m-%d %H:%M:%S")
+            save_cache(room, msgs)
+            save_meta(room, meta)
+    except LockTimeout:
+        print(f"sync 見送り: 保存ロックを {LOCK_TIMEOUT_SEC} 秒待っても取得できませんでした。"
+              "今回の保存は行わず、取得済みの差分は次回の sync で回収されます。")
+        return
     extra = f" / redaction 反映 {redacted}件" if redacted else ""
     print(f"sync ok: +{total_new}件{extra} / キャッシュ合計 {len(msgs)}件 / 最新ID {max(msgs) if msgs else 0}")
     if capped:
@@ -512,7 +596,7 @@ def cmd_kit(name=None, full=False):
             line += f" — {ent['note']}"
         print(line)
     os.makedirs(CACHE_DIR, exist_ok=True)
-    tmp = _kit_index_path() + ".tmp"
+    tmp = _unique_tmp(_kit_index_path())
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(current, f, ensure_ascii=False, indent=1)
     os.replace(tmp, _kit_index_path())
@@ -536,7 +620,7 @@ def _kit_load_index_map():
 
 def _kit_save_index_map(mapping):
     os.makedirs(CACHE_DIR, exist_ok=True)
-    tmp = _kit_index_path() + ".tmp"
+    tmp = _unique_tmp(_kit_index_path())
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(mapping, f, ensure_ascii=False, indent=1)
     os.replace(tmp, _kit_index_path())
@@ -594,7 +678,7 @@ def kit_daily_check():
         new_state["ok"] = False
         new_state["error"] = str(e)[:200]
         print(f"kit: 日次チェックに失敗しました（sync 本体には影響しません）: {e}")
-    tmp = _kit_check_path() + ".tmp"
+    tmp = _unique_tmp(_kit_check_path())
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(new_state, f, ensure_ascii=False, indent=1)
     os.replace(tmp, _kit_check_path())
@@ -668,9 +752,17 @@ def cmd_unread(room, mark):
     print(f"未読 {len(items)}件（カーソル #{cur} より後）")
     show(room, items)
     if mark and items:
-        meta["read_cursor"] = max(msgs)
-        save_meta(room, meta)
-        print(f"既読カーソルを #{meta['read_cursor']} に進めた")
+        try:
+            with room_lock(room):
+                msgs_now = load_cache(room)
+                meta = load_meta(room)
+                if msgs_now:
+                    meta["read_cursor"] = max(msgs_now)
+                save_meta(room, meta)
+            print(f"既読カーソルを #{meta['read_cursor']} に進めた")
+        except LockTimeout:
+            print(f"既読化見送り: 保存ロックを {LOCK_TIMEOUT_SEC} 秒待っても取得できませんでした。"
+                  "カーソルは進めていません（次回に回収されます）。")
 
 
 def cmd_after(room, after_id, full):
@@ -782,13 +874,18 @@ def cmd_rooms():
 
 
 def cmd_purge(room, mid):
-    msgs = load_cache(room)
-    if mid in msgs:
-        msgs[mid] = tombstone(msgs[mid])
-        save_cache(room, msgs)
-        print(f"#{mid} の本文を消去した")
-    else:
-        print(f"#{mid} はキャッシュに無い")
+    try:
+        with room_lock(room):
+            msgs = load_cache(room)
+            if mid in msgs:
+                msgs[mid] = tombstone(msgs[mid])
+                save_cache(room, msgs)
+                print(f"#{mid} の本文を消去した")
+            else:
+                print(f"#{mid} はキャッシュに無い")
+    except LockTimeout:
+        print(f"purge 見送り: 保存ロックを {LOCK_TIMEOUT_SEC} 秒待っても取得できませんでした。"
+              "消去は行っていません（次回に回収されます）。")
 
 
 def main():
